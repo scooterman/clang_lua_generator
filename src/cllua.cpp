@@ -29,7 +29,7 @@
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Tooling/Tooling.h>
 #include <clang/Tooling/CommonOptionsParser.h>
-#include <llvm/Support/CommandLine.h>
+#include <clang/Frontend/FrontendPluginRegistry.h>
 
 #include <unordered_map>
 #include <sstream>
@@ -39,15 +39,19 @@ using namespace clang;
 using namespace std;
 using namespace clang::tooling;
 
-
-
 std::string getCanonicalTypeFromQualifiedType(const QualType& type) {
     LangOptions lo;
     PrintingPolicy pp(lo);
     pp.Bool = true;
     pp.SuppressTagKeyword = true;
     
-    return type.getNonReferenceType().getCanonicalType().getUnqualifiedType().getAsString(pp);
+    QualType qt = type;
+    
+    if (type->isPointerType()) {    
+        qt = type->getPointeeType();
+    }
+   
+    return qt.getLocalUnqualifiedType().getNonReferenceType().getCanonicalType().getUnqualifiedType().getAsString(pp);
 }
 
 struct CxxType {  
@@ -76,7 +80,8 @@ struct MethodDefinition {
     
     std::vector<MethodParameter> parameters;    
     std::string name;
-
+    bool isVirtual = false;
+    
     MethodParameter retType;    
     FuncType functionType = FuncType::method;
 };
@@ -85,15 +90,15 @@ class ClassDefinition {
 public:
     std::vector< MethodDefinition > methods;
     
-    std::set < ClassDefinition* > dependencies;
+    std::set < std::string > dependencies;
     std::set < ClassDefinition* > bases;
      
     std::string name;
-    
+    std::string qualifiedName;
     unsigned int classID = 0;
     bool processed = false;
     
-    ClassDefinition(const std::string& _name) : name(_name) {
+    ClassDefinition(const std::string& _name, const std::string& _qualifiedName) : name(_name), qualifiedName(_qualifiedName) {
     }
 };
 
@@ -123,7 +128,7 @@ CxxType* makeType(const QualType& paramType) {
         type->ns = type->type.substr(0, type->type.rfind("::"));
         type->type = type->type.substr(type->ns.length() + 2, type->type.length() - (type->ns.length() + 2));
     }
-      
+
     typeMapping[typeName] = type;
     return type;
 }
@@ -142,22 +147,39 @@ MethodParameter makeParameter(const QualType& param) {
 }
 
 template <typename dc>
-MethodDefinition createMethod(MethodDefinition::FuncType ft, const dc& decl ) {
+MethodDefinition createMethod(MethodDefinition::FuncType ft, const dc& decl , ClassDefinition& cdef) {
     MethodDefinition md;
     md.name = decl.getNameAsString();
     md.functionType = ft;
-
+    md.isVirtual = decl.isVirtual();
+    
     for (auto param = decl.param_begin(); param != decl.param_end(); ++param) {
         QualType paramType = (*param)->getType();
 
         MethodParameter cxxParam = makeParameter(paramType);
         cxxParam.name = (*param)->getDeclName().getAsString();       
 
+        if (cxxParam.type->spelling != cdef.name
+            && !paramType->isIncompleteType()
+                && paramType->isClassType()
+                || (paramType->isPointerType() &&  paramType->getPointeeType()->isClassType())) {
+            cdef.dependencies.insert(cxxParam.type->spelling);
+        }
+
         md.parameters.push_back(cxxParam);
     }
     
     if (ft != MethodDefinition::FuncType::constructor) {
-        md.retType =  makeParameter(decl.getResultType());
+        QualType retType = decl.getResultType();
+        md.retType =  makeParameter(retType);
+
+        if (md.retType.type->spelling != cdef.name
+                && !retType->isIncompleteType()
+                && retType->isClassType()
+                || (retType->isPointerType()
+                    && retType->getPointeeType()->isClassType())) {
+            cdef.dependencies.insert(md.retType.type->spelling);
+        }
     }
     
     return md;
@@ -188,13 +210,13 @@ public:
             return true;
         }
               
-        std::string className = record->getQualifiedNameAsString();
+        std::string qualname = record->getQualifiedNameAsString();
     
-        if (classMapping.count(className) == 0) {
-            classMapping[className] = new ClassDefinition(className);
+        if (classMapping.count(qualname) == 0) {
+            classMapping[qualname] = new ClassDefinition(record->getNameAsString(), qualname);
         }
 
-        ClassDefinition* clazz = classMapping[className];
+        ClassDefinition* clazz = classMapping[qualname];
                
         bool hasConstructors = false;
         //parsing constructors
@@ -203,12 +225,12 @@ public:
                 continue;
             }
             
-            clazz->methods.push_back(createMethod<CXXConstructorDecl>(MethodDefinition::FuncType::constructor, **it));
+            clazz->methods.push_back(createMethod<CXXConstructorDecl>(MethodDefinition::FuncType::constructor, **it, *clazz));
             hasConstructors = true;
         }
         
          //if the default constructor is undeclared, manually create one with no parameters
-        if (!hasConstructors) {
+        if (false) {
             if (!record->hasDeclaredDefaultConstructor()) {
                 MethodDefinition md;
                 md.functionType = MethodDefinition::FuncType::constructor;                
@@ -221,11 +243,11 @@ public:
             std::string qualType = getCanonicalTypeFromQualifiedType(it->getType());
                
             if (classMapping.count(qualType) == 0) {
-                classMapping[qualType] = new ClassDefinition(qualType);                
+                classMapping[qualType] = new ClassDefinition(qualType, qualType);                
             }
 
             clazz->bases.insert(classMapping[qualType]);
-            clazz->dependencies.insert(classMapping[qualType]);
+            clazz->dependencies.insert(qualType);
         }
 
         //parsing methods
@@ -235,7 +257,7 @@ public:
                 continue;
             }
             
-            clazz->methods.push_back(createMethod<CXXMethodDecl>(MethodDefinition::FuncType::method, **method));
+            clazz->methods.push_back(createMethod<CXXMethodDecl>(MethodDefinition::FuncType::method, **method, *clazz));
         }
         
         return true;
@@ -265,9 +287,10 @@ class BuildLuaBindingsAction : public ASTFrontendAction {
 public:
 
     BuildLuaBindingsAction() { }
+
     virtual clang::ASTConsumer *CreateASTConsumer (
         clang::CompilerInstance &Compiler, llvm::StringRef InFile ) {
-        //Compiler.getDiagnostics().setSuppressAllDiagnostics(true);
+        Compiler.getDiagnostics().setSuppressAllDiagnostics(true);
         tool = new LuaBinderConsumer(Compiler.getSourceManager());
         return tool;
     }
@@ -299,23 +322,29 @@ std::string dump(gdx::JsonValue& classDef, const ClassDefinition& def) {
     std::stringstream ss;
     
     unsigned int i = 0;
-    classDef[def.name]["dependencies"].as_array();
+    gdx::JsonValue& jdef = classDef[def.qualifiedName];
+    
+    jdef["name"].as_string() = def.name;
+    jdef["qualname"].as_string() = def.qualifiedName;
+    
+    jdef["dependencies"].as_array();
     for (const auto& dependency : def.dependencies) {
-        classDef[def.name]["dependencies"].at(i++).as_string() = dependency->name;
+        jdef["dependencies"].at(i++).as_string() = dependency;
     }
     
     i = 0;
-    classDef[def.name]["bases"].as_array();
+    jdef["bases"].as_array();
     for (const auto& dependency : def.bases) {
-        classDef[def.name]["bases"].at(i++).as_string() = dependency->name;
+        jdef["bases"].at(i++).as_string() = dependency->name;
     }        
     
     i = 0;
-    classDef[def.name]["functions"].as_array();
+    jdef["functions"].as_array();
     for (const auto& method : def.methods) {
         gdx::JsonValue function {
             "func_type", (method.functionType == MethodDefinition::FuncType::constructor ? "constructor" : "function"),
-            "name", method.name
+            "name", method.name,
+            "is_virtual", method.isVirtual
         };
         
         int j = 0;
@@ -328,7 +357,7 @@ std::string dump(gdx::JsonValue& classDef, const ClassDefinition& def) {
             function["return"] = dumpParam(method.retType);            
         }
         
-        classDef[def.name]["functions"].at(i++) = function;
+        jdef["functions"].at(i++) = function;
     }
 
     return ss.str();
@@ -350,12 +379,20 @@ int main ( int argc, const char** argv ) {
         dump(json["classes"], *cls.second);
     }
 
-    std::ofstream of;
-    of.open(OutputPath, std::ios::out);
+    std::string jsonstr = json.toString();
+
+    FILE* f = nullptr;
+    f = fopen(OutputPath.c_str(), "w");
+    fwrite(jsonstr.c_str(), 1, jsonstr.length(), f);
+
+    fclose(f);
+
+//    std::ofstream of;
+//    of.open(OutputPath);
     
-    of << json.toString();
+//    of << jsonstr;
     
-    of.close();
+//    of.close();
     
     return result;
 }
