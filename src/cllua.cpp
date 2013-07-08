@@ -88,6 +88,7 @@ struct MethodDefinition {
 
 class ClassDefinition {
 public:
+    bool isTemplated = false;
     std::vector< MethodDefinition > methods;
     
     std::set < std::string > dependencies;
@@ -111,39 +112,65 @@ CxxType* makeType(const QualType& paramType) {
     if (typeMapping.count(typeName)) {
         return typeMapping[typeName];
     }
-    
+
     CxxType* type = new CxxType;
     
-    type->spelling = typeName;
-    
-    std::string typeStr = typeName;
-        
-    if (typeName.find("<") != std::string::npos) {
-        type->type = typeName.substr(0, typeName.rfind(">") + 1);
-    } else {
-        type->type = type->spelling;
-    }
-    
-    if (type->type.find("::") != std::string::npos) {
-        type->ns = type->type.substr(0, type->type.rfind("::"));
-        type->type = type->type.substr(type->ns.length() + 2, type->type.length() - (type->ns.length() + 2));
+    const Type* tp = paramType.getTypePtr();
+
+    if (paramType->isPointerType() || paramType->isReferenceType()) {
+        tp = tp->getPointeeType().getTypePtr();
     }
 
+    type->spelling = typeName;
     typeMapping[typeName] = type;
+
+    CXXRecordDecl* decl = tp->getAsCXXRecordDecl();
+
+    if (decl) {
+       DeclContext* ctx = decl->getDeclContext();
+       std::vector< DeclContext*> contexts;
+
+       while (ctx && isa<NamedDecl>(ctx)) {
+           contexts.push_back(ctx);
+           ctx = ctx->getParent();
+       }
+
+       for (auto ci = contexts.rbegin(), end = contexts.rend();
+                 ci != end;
+                 ci++) {
+           if (const NamespaceDecl* NS = dyn_cast<NamespaceDecl>(*ci)) {
+               type->ns += (type->ns.empty() ? "" : "::") + NS->getNameAsString();
+           }
+       }
+
+       type->type = type->spelling.substr(type->spelling.find(type->ns) + type->ns.size() + 2 /*len("::")*/, std::string::npos);
+    }
+
     return type;
 }
 
 MethodParameter makeParameter(const QualType& param) {
-    CxxType* type = makeType(param);
-
     MethodParameter cxxParam;
 
-    cxxParam.type = type;
     cxxParam.isPointer = param->isPointerType();
     cxxParam.isReference = param->isReferenceType();
-    cxxParam.isConst = param.getQualifiers().hasConst();
-    
+    cxxParam.isConst = param.isConstQualified();
+    cxxParam.type =  makeType(param);
+
+    if (param->isReferenceType()) {
+        cxxParam.isConst = param->getPointeeType().isConstQualified();
+    }
+
     return cxxParam;
+}
+
+void processDependency(MethodParameter& mp, const QualType& qualType, ClassDefinition& cdef) {
+    if (mp.type->spelling != cdef.name
+        && !qualType->isIncompleteType()
+            && qualType->isClassType()
+            || ((qualType->isPointerType() || qualType->isReferenceType()) &&  qualType->getPointeeType()->isClassType())) {
+        cdef.dependencies.insert(mp.type->spelling);
+    }
 }
 
 template <typename dc>
@@ -159,27 +186,14 @@ MethodDefinition createMethod(MethodDefinition::FuncType ft, const dc& decl , Cl
         MethodParameter cxxParam = makeParameter(paramType);
         cxxParam.name = (*param)->getDeclName().getAsString();       
 
-        if (cxxParam.type->spelling != cdef.name
-            && !paramType->isIncompleteType()
-                && paramType->isClassType()
-                || (paramType->isPointerType() &&  paramType->getPointeeType()->isClassType())) {
-            cdef.dependencies.insert(cxxParam.type->spelling);
-        }
-
+        processDependency(cxxParam, paramType, cdef);
         md.parameters.push_back(cxxParam);
     }
     
     if (ft != MethodDefinition::FuncType::constructor) {
-        QualType retType = decl.getResultType();
-        md.retType =  makeParameter(retType);
-
-        if (md.retType.type->spelling != cdef.name
-                && !retType->isIncompleteType()
-                && retType->isClassType()
-                || (retType->isPointerType()
-                    && retType->getPointeeType()->isClassType())) {
-            cdef.dependencies.insert(md.retType.type->spelling);
-        }
+        const QualType& retType = decl.getResultType();
+        md.retType =  makeParameter(retType);    
+        processDependency(md.retType, retType, cdef);
     }
     
     return md;
@@ -205,19 +219,25 @@ public:
 //             }
 //         }
 
-        //we ignore abstract and non-classes
-        if(!record->isCompleteDefinition() || (!record->isClass() && !record->isAbstract())) {
+        //we ignore abstract, private and non-classes
+        if(!record->isCompleteDefinition()
+                 || (!record->isClass() && !record->isAbstract())) {
             return true;
         }
-              
+
         std::string qualname = record->getQualifiedNameAsString();
     
         if (classMapping.count(qualname) == 0) {
             classMapping[qualname] = new ClassDefinition(record->getNameAsString(), qualname);
         }
 
-        ClassDefinition* clazz = classMapping[qualname];
-               
+        ClassDefinition* clazz = classMapping[qualname];      
+
+        if (record->getDescribedClassTemplate()) {
+            //we have a templated class, mark that
+            classMapping[qualname]->isTemplated = true;
+        }
+
         bool hasConstructors = false;
         //parsing constructors
         for(auto it = record->ctor_begin(); it != record->ctor_end(); ++it) {
@@ -332,6 +352,8 @@ std::string dump(gdx::JsonValue& classDef, const ClassDefinition& def) {
         jdef["dependencies"].at(i++).as_string() = dependency;
     }
     
+    jdef["templated"] = def.isTemplated;
+
     i = 0;
     jdef["bases"].as_array();
     for (const auto& dependency : def.bases) {
