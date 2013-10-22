@@ -39,6 +39,11 @@ using namespace clang;
 using namespace std;
 using namespace clang::tooling;
 
+static llvm::cl::opt<std::string> OutputPath(
+   "o", llvm::cl::desc("Output file"), llvm::cl::Required);
+
+static llvm::cl::list< std::string> IncludeMatches ("M", llvm::cl::desc("Comma separated list of strings to match when parsing a record definition."));
+
 std::string getCanonicalTypeFromQualifiedType(const QualType& type) {
     LangOptions lo;
     PrintingPolicy pp(lo);
@@ -205,20 +210,6 @@ public:
     }
 
     virtual bool VisitCXXRecordDecl(CXXRecordDecl* record) {
-        if (sourceManager.getFileID ( record->getLocation() ) != sourceManager.getMainFileID() ) {
-            return true;
-        }
-        
-//         bool invalid;
-//         auto sentry = sourceManager.getSLocEntry(sourceManager.getFileID ( record->getLocation() ), &invalid);
-//         
-//         if (!invalid) {
-//             const FileEntry* entry = sourceManager.getFileEntryForSLocEntry(sentry);
-//             if (entry) {
-//                 std::cout << "file is: " << entry->getName() << std::endl;
-//             }
-//         }
-
         //we ignore abstract, private and non-classes
         if(!record->isCompleteDefinition()
                  || (!record->isClass() && !record->isAbstract())) {
@@ -227,6 +218,20 @@ public:
 
         std::string qualname = record->getQualifiedNameAsString();
     
+        if (!IncludeMatches.empty()) {
+            bool matched = false;
+            for(const std::string& match : IncludeMatches) {
+                if (qualname.find(match) != std::string::npos) {
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (!matched) {
+                return true;
+            }
+        }
+
         if (classMapping.count(qualname) == 0) {
             classMapping[qualname] = new ClassDefinition(record->getNameAsString(), qualname);
         }
@@ -385,11 +390,12 @@ std::string dump(gdx::JsonValue& classDef, const ClassDefinition& def) {
     return ss.str();
 }
 
+
 int main ( int argc, const char** argv ) {
-    static llvm::cl::opt<std::string> OutputPath(
-       "o", llvm::cl::desc("Output file"), llvm::cl::Required);
-    
     CommonOptionsParser parser( argc, argv );
+
+    std::ofstream of;
+    of.open(OutputPath, std::ofstream::out);
     
     ClangTool tool(parser.GetCompilations(), parser.GetSourcePathList());
 
@@ -402,19 +408,9 @@ int main ( int argc, const char** argv ) {
     }
 
     std::string jsonstr = json.toString();
-
-    FILE* f = nullptr;
-    f = fopen(OutputPath.c_str(), "w");
-    fwrite(jsonstr.c_str(), 1, jsonstr.length(), f);
-
-    fclose(f);
-
-//    std::ofstream of;
-//    of.open(OutputPath);
     
-//    of << jsonstr;
-    
-//    of.close();
+    of << jsonstr;
+    of.close();
     
     return result;
 }
